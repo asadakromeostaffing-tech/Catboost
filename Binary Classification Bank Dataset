@@ -1,0 +1,421 @@
+# =========================
+# XGBoost Starter Notebook  ->  CatBoost Version (Robust / No-orig fallback)
+# =========================
+
+# (Optional) NVIDIA cuDF Pandas acceleration
+try:
+    get_ipython().run_line_magic('load_ext', 'cudf.pandas')
+    print("Using cuDF pandas acceleration.")
+except Exception:
+    print("cudf.pandas not available; using standard pandas on CPU.")
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
+
+# CatBoost
+import catboost
+from catboost import CatBoostClassifier, Pool
+
+# --- TargetEncoder: prefer RAPIDS (GPU), otherwise a simple CPU fallback ---
+try:
+    from cuml.preprocessing import TargetEncoder as _CuMLTargetEncoder  # RAPIDS
+    class TargetEncoder(_CuMLTargetEncoder):
+        pass
+    print("Using cuML TargetEncoder.")
+except Exception:
+    print("cuML TargetEncoder not available; using a simple CPU TargetEncoder fallback.")
+    class TargetEncoder:
+        def __init__(self, n_folds=10, smooth=0, split_method='random', stat='mean'):
+            self.global_mean_ = None
+            self.map_ = None
+        def fit(self, x, y):
+            # x: pd.Series-like; y: pd.Series-like
+            self.global_mean_ = float(pd.Series(y).mean())
+            df = pd.DataFrame({"x": pd.Series(x).values, "y": pd.Series(y).values})
+            self.map_ = df.groupby("x")["y"].mean()
+            return self
+        def transform(self, x):
+            out = pd.Series(x).map(self.map_).astype('float32')
+            return out.fillna(np.float32(self.global_mean_)).values
+        def fit_transform(self, x, y):
+            self.fit(x, y)
+            return self.transform(x)
+
+# -----------------
+# Load Data
+# -----------------
+PATH = "/kaggle/input/playground-series-s5e8/"
+
+train = pd.read_csv(f"{PATH}train.csv").set_index('id')
+print("Train shape", train.shape)
+display(train.head())
+
+test = pd.read_csv(f"{PATH}test.csv").set_index('id')
+test['y'] = -1  # sentinel to allow concat with label present
+print("Test shape", test.shape)
+display(test.head())
+
+# Try to load the external 'orig' dataset; if missing, continue without it.
+BANK_FULL_PATH = "/kaggle/input/bank-marketing-dataset-full/bank-full.csv"
+orig_present = os.path.exists(BANK_FULL_PATH)
+
+if orig_present:
+    orig = pd.read_csv(BANK_FULL_PATH, delimiter=";")
+    # Ensure binary y
+    orig['y'] = orig['y'].map({'yes': 1, 'no': 0}).astype('int32')
+    # Give orig an index that won't collide with train/test
+    orig['id'] = (np.arange(len(orig)) + 1_000_000).astype('int64')
+    orig = orig.set_index('id')
+    print("Original data shape", orig.shape)
+    display(orig.head())
+else:
+    print(f"WARNING: '{BANK_FULL_PATH}' not found. Proceeding WITHOUT external 'orig' augmentation/TE.")
+    # Create an empty 'orig' with the same columns as train for safe concatenation
+    orig = train.iloc[0:0].copy()
+
+# -----------------
+# EDA (combine + column types)
+# -----------------
+# Concatenate only available frames (orig may be empty)
+combine = pd.concat([train, test, orig], axis=0, sort=False)
+print("Combined data shape", combine.shape)
+
+# Make sure label is present and get feature columns explicitly (no 'y')
+assert 'y' in combine.columns, "Expected 'y' column to exist."
+FEATURE_INPUT_COLS = [c for c in combine.columns if c != 'y']
+
+CATS, NUMS = [], []
+for c in FEATURE_INPUT_COLS:
+    if combine[c].dtype == 'object':
+        CATS.append(c)
+        t = "CAT"
+    else:
+        NUMS.append(c)
+        t = "NUM"
+    n = combine[c].nunique(dropna=True)
+    na = combine[c].isna().sum()
+    print(f"[{t}] {c} has {n} unique and {na} NA")
+print("CATS:", CATS)
+print("NUMS:", NUMS)
+
+# -----------------
+# Feature Engineer (LE - Label Encode)
+# - Factorize CATS in-place; create NUMS2 as categorical copies
+# -----------------
+CATS1 = []    # categorical copies for numeric features
+SIZES = {}    # cardinalities for all categorical-like cols encoded
+
+for c in NUMS + CATS:
+    n = c
+    if c in NUMS:
+        # For numeric columns, keep original numeric (cast to int32) and add a factorized copy as categorical
+        n = f"{c}2"
+        CATS1.append(n)
+        combine[n], _ = pd.factorize(combine[c], sort=False)
+        combine[n] = combine[n].astype('int32')
+        SIZES[n] = (combine[n].max() + 1) if combine[n].notna().any() else 0
+        # Keep numeric in a compact int (if float, you may want to keep float32 instead)
+        if not np.issubdtype(combine[c].dtype, np.integer):
+            # If it's float-like, you might prefer float32 to avoid truncating information:
+            # combine[c] = combine[c].astype('float32')
+            # The original logic casts to int32; we follow that:
+            combine[c] = combine[c].fillna(0).astype('int32')
+        else:
+            combine[c] = combine[c].astype('int32')
+    else:
+        # For categorical columns, overwrite with factorized codes
+        combine[c], _ = pd.factorize(combine[c], sort=False)
+        combine[c] = combine[c].astype('int32')
+        SIZES[c] = (combine[c].max() + 1) if combine[c].notna().any() else 0
+
+print("New CATS (numeric copies):", CATS1)
+print("Cardinality of encodings:", SIZES)
+
+# -----------------
+# Feature Engineer (Combine Column Pairs)
+# -----------------
+from itertools import combinations
+
+pairs = combinations(CATS + CATS1, 2)
+new_cols = {}
+CATS2 = []
+
+for c1, c2 in pairs:
+    size2 = SIZES.get(c2, int(combine[c2].max() + 1) if c2 in combine.columns else 0)
+    name = "_".join(sorted((c1, c2)))
+    if c1 in combine.columns and c2 in combine.columns:
+        new_cols[name] = combine[c1].astype('int64') * int(size2) + combine[c2].astype('int64')
+        CATS2.append(name)
+
+if new_cols:
+    new_df = pd.DataFrame(new_cols, index=combine.index)
+    combine = pd.concat([combine, new_df], axis=1)
+
+print(f"Created {len(CATS2)} new CAT columns from pairs.")
+
+# -----------------
+# Feature Engineer (CE - Count Encoding)
+# -----------------
+CE = []
+CC = [c for c in (CATS + CATS1 + CATS2) if c in combine.columns]
+
+print(f"Processing {len(CC)} columns for Count Encoding... ", end="")
+for i, c in enumerate(CC):
+    if i % 10 == 0:
+        print(f"{i}, ", end="")
+    tmp = combine.groupby(c)['y'].count().astype('int32')
+    tmp.name = f"CE_{c}"
+    CE.append(tmp.name)
+    combine = combine.merge(tmp, on=c, how='left')
+print()
+
+# Split back
+train = combine.iloc[:len(train)].copy()
+test  = combine.iloc[len(train):len(train)+len(test)].copy()
+orig  = combine.iloc[-len(orig):].copy() if len(orig) > 0 else orig
+del combine
+print("Train shape", train.shape, "Test shape", test.shape, "Original shape", orig.shape)
+
+# -----------------
+# CatBoost version info
+# -----------------
+print(f"CatBoost version {catboost.__version__}")
+
+# -----------------
+# Hyperparameters
+# -----------------
+FEATURES = [f for f in (NUMS + CATS + CATS1 + CATS2 + CE) if f in train.columns]
+print(f"We have {len(FEATURES)} features.")
+
+FOLDS = 7
+SEED = 42
+
+CAT_PARAMS = dict(
+    loss_function='Logloss',
+    eval_metric='AUC',
+    learning_rate=0.1,
+    depth=8,
+    subsample=0.8,
+    rsm=0.7,
+    random_seed=SEED,
+    l2_leaf_reg=2.0,
+    task_type='GPU',   # Will fall back to CPU if GPU unavailable
+    devices='0',
+)
+
+def to_pandas_safe(df):
+    try:
+        if hasattr(df, "to_pandas"):
+            return df.to_pandas()
+    except Exception:
+        pass
+    return pd.DataFrame(df)
+
+def fit_catboost_with_fallback(dtrain, dval, params, iterations=10_000, verbose=200, es_rounds=200):
+    # Try GPU first (if requested), then fallback to CPU
+    from copy import deepcopy
+    p = deepcopy(params)
+    try:
+        model = CatBoostClassifier(**p, iterations=iterations)
+        model.fit(dtrain, eval_set=dval, verbose=verbose, early_stopping_rounds=es_rounds)
+        return model
+    except Exception as e:
+        if p.get('task_type', '').upper() == 'GPU':
+            print(f"GPU training failed, falling back to CPU. Reason: {repr(e)}")
+            p['task_type'] = 'CPU'
+            p.pop('devices', None)
+            model = CatBoostClassifier(**p, iterations=iterations)
+            model.fit(dtrain, eval_set=dval, verbose=verbose, early_stopping_rounds=es_rounds)
+            return model
+        else:
+            raise
+
+# -----------------
+# Train CatBoost w/ Original Data as Rows (augmentation) if orig present
+# -----------------
+oof_preds = np.zeros(len(train), dtype=np.float32)
+test_preds = np.zeros(len(test), dtype=np.float32)
+
+kf = KFold(n_splits=FOLDS, shuffle=True, random_state=SEED)
+for fold, (train_idx, val_idx) in enumerate(kf.split(train)):
+    print("#"*25)
+    print(f"### Fold {fold+1} ###")
+    print("#"*25)
+
+    cols_for_run = FEATURES + ['y']
+    Xy_train = train.iloc[train_idx][cols_for_run].copy()
+    X_valid  = train.iloc[val_idx][FEATURES].copy()
+    y_valid  = train.iloc[val_idx]['y'].copy()
+    X_test   = test[FEATURES].copy()
+
+    # Append orig rows only if we actually have them
+    if orig_present and len(orig) > 0:
+        Xy_more = orig[[c for c in cols_for_run if c in orig.columns]].copy()
+        # Ensure all features exist in Xy_more; if not, fill
+        for c in FEATURES:
+            if c not in Xy_more.columns:
+                Xy_more[c] = np.nan
+        Xy_train = pd.concat([Xy_train, Xy_more[cols_for_run]], axis=0, ignore_index=True)
+
+    # Target encoding of high-cardinality engineered cats
+    CC_te = [c for c in (CATS1 + CATS2) if c in Xy_train.columns]
+    print(f"Target encoding {len(CC_te)} features... ", end="")
+    for i, c in enumerate(CC_te):
+        if i % 10 == 0:
+            print(f"{i}, ", end="")
+        TE0 = TargetEncoder(n_folds=10, smooth=0, split_method='random', stat='mean')
+        Xy_train[c] = TE0.fit_transform(Xy_train[c], Xy_train['y']).astype('float32')
+        X_valid[c]  = TE0.transform(X_valid[c]).astype('float32')
+        X_test[c]   = TE0.transform(X_test[c]).astype('float32')
+    print()
+
+    # Declare cat features = only the original categorical columns (now int-coded)
+    cats_in_frame = [c for c in CATS if c in Xy_train.columns]
+    Xtr = to_pandas_safe(Xy_train[FEATURES])
+    ytr = to_pandas_safe(Xy_train['y'])
+    Xva = to_pandas_safe(X_valid)
+    yva = to_pandas_safe(y_valid)
+    Xte = to_pandas_safe(X_test)
+
+    cat_idx = [Xtr.columns.get_loc(c) for c in cats_in_frame if c in Xtr.columns]
+
+    dtrain = Pool(Xtr, label=ytr, cat_features=cat_idx)
+    dval   = Pool(Xva, label=yva, cat_features=cat_idx)
+    dtest  = Pool(Xte, cat_features=cat_idx)
+
+    model = fit_catboost_with_fallback(dtrain, dval, CAT_PARAMS, iterations=10_000, verbose=200, es_rounds=200)
+
+    oof_preds[val_idx] = model.predict_proba(dval)[:, 1]
+    test_preds += model.predict_proba(dtest)[:, 1] / FOLDS
+
+# CV Score
+m = roc_auc_score(train.y, oof_preds)
+print(f"CatBoost with Original Data as rows CV = {m:.6f}")
+
+# -----------------
+# Feature Importance (CatBoost) for last model
+# -----------------
+imp_vals = model.get_feature_importance(dtrain)
+imp_df = pd.DataFrame({'feature': Xtr.columns, 'importance': imp_vals})
+imp_df = imp_df.sort_values('importance', ascending=False).head(20)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.barh(imp_df.feature[::-1], imp_df.importance[::-1])
+ax.set_title("Top 20 Feature Importances (CatBoost)")
+ax.set_xlabel("Importance")
+plt.tight_layout()
+plt.show()
+
+# -----------------
+# Train CatBoost w/ Original Data as Columns (TE from 'orig') if orig present
+# -----------------
+TE_ORIG = []
+if orig_present and len(orig) > 0:
+    CC_all = [c for c in (CATS + CATS1 + CATS2) if c in orig.columns]
+    print(f"Computing TE_ORIG for {len(CC_all)} columns... ", end="")
+    for i, c in enumerate(CC_all):
+        if i % 10 == 0:
+            print(f"{i}, ", end="")
+        tmp = orig.groupby(c)['y'].mean().astype('float32')
+        tmp.name = f"TE_ORIG_{c}"
+        TE_ORIG.append(tmp.name)
+        # Safe merge: only merge if 'c' exists in target frame
+        if c in train.columns:
+            train = train.merge(tmp, on=c, how='left')
+        if c in test.columns:
+            test  = test.merge(tmp, on=c, how='left')
+    print()
+else:
+    print("Skipping TE_ORIG creation (no external 'orig' dataset).")
+
+FEATURES2 = FEATURES + TE_ORIG
+print(f"We have {len(FEATURES2)} features for the 'columns' variant.")
+
+oof_preds2 = np.zeros(len(train), dtype=np.float32)
+test_preds2 = np.zeros(len(test), dtype=np.float32)
+
+kf = KFold(n_splits=FOLDS, shuffle=True, random_state=SEED)
+for fold, (train_idx, val_idx) in enumerate(kf.split(train)):
+    print("#"*25)
+    print(f"### (Columns) Fold {fold+1} ###")
+    print("#"*25)
+
+    cols_for_run = FEATURES2 + ['y']
+    Xy_train = train.iloc[train_idx][cols_for_run].copy()
+    X_valid  = train.iloc[val_idx][FEATURES2].copy()
+    y_valid  = train.iloc[val_idx]['y'].copy()
+    X_test   = test[FEATURES2].copy()
+
+    # Target encoding of high-cardinality engineered cats on this variant too
+    CC_te = [c for c in (CATS1 + CATS2) if c in Xy_train.columns]
+    print(f"Target encoding {len(CC_te)} features... ", end="")
+    for i, c in enumerate(CC_te):
+        if i % 10 == 0:
+            print(f"{i}, ", end="")
+        TE0 = TargetEncoder(n_folds=10, smooth=0, split_method='random', stat='mean')
+        Xy_train[c] = TE0.fit_transform(Xy_train[c], Xy_train['y']).astype('float32')
+        X_valid[c]  = TE0.transform(X_valid[c]).astype('float32')
+        X_test[c]   = TE0.transform(X_test[c]).astype('float32')
+    print()
+
+    cats_in_frame = [c for c in CATS if c in Xy_train.columns]
+    Xtr = to_pandas_safe(Xy_train[FEATURES2])
+    ytr = to_pandas_safe(Xy_train['y'])
+    Xva = to_pandas_safe(X_valid)
+    yva = to_pandas_safe(y_valid)
+    Xte = to_pandas_safe(X_test)
+
+    cat_idx = [Xtr.columns.get_loc(c) for c in cats_in_frame if c in Xtr.columns]
+
+    dtrain = Pool(Xtr, label=ytr, cat_features=cat_idx)
+    dval   = Pool(Xva, label=yva, cat_features=cat_idx)
+    dtest  = Pool(Xte, cat_features=cat_idx)
+
+    model = fit_catboost_with_fallback(dtrain, dval, CAT_PARAMS, iterations=10_000, verbose=200, es_rounds=200)
+
+    oof_preds2[val_idx] = model.predict_proba(dval)[:, 1]
+    test_preds2 += model.predict_proba(dtest)[:, 1] / FOLDS
+
+# CV Score for columns-variant
+m2 = roc_auc_score(train.y, oof_preds2)
+print(f"CatBoost with Original Data as columns CV = {m2:.6f}")
+
+# Feature Importance for this model (last fold)
+imp_vals = model.get_feature_importance(dtrain)
+imp_df = pd.DataFrame({'feature': Xtr.columns, 'importance': imp_vals})
+imp_df = imp_df.sort_values('importance', ascending=False).head(20)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.barh(imp_df.feature[::-1], imp_df.importance[::-1])
+ax.set_title("Top 20 Feature Importances (CatBoost) - Columns Variant")
+ax.set_xlabel("Importance")
+plt.tight_layout()
+plt.show()
+
+# -----------------
+# Ensemble
+# -----------------
+m_ens = roc_auc_score(train.y, oof_preds + oof_preds2)
+print(f"Ensemble CV = {m_ens:.6f}")
+
+# -----------------
+# Create Submission CSV
+# -----------------
+sub = pd.read_csv(f"{PATH}sample_submission.csv")
+sub['y'] = (test_preds + test_preds2) / 2.0
+sub.to_csv("submission.csv", index=False)
+print('Submission shape', sub.shape)
+display(sub.head())
+
+# -----------------
+# EDA Test Preds
+# -----------------
+plt.hist(sub.y, bins=100)
+plt.title('Test Preds')
+plt.ylim((0, 10_000))
+plt.show()
